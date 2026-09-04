@@ -221,9 +221,12 @@ def repl(app: App) -> None:
             _new_session(app)
             continue
         if text == "/sessions":
-            for d in app.store.list_sessions()[:15]:
-                mark = "*" if d["id"] == app.session_id else " "
-                ui.info(f"{mark} {d.get('title', d['id'])}  ·  {_age(d.get('updated', 0))}"
+            others = [d for d in app.store.list_sessions() if d["id"] != app.session_id][:15]
+            if not others:
+                ui.info("No other sessions.")
+                continue
+            for d in others:
+                ui.info(f"  {d.get('title', d['id'])}  ·  {_age(d.get('updated', 0))}"
                         f"  ·  {d.get('turns', 0)} turns")
             continue
         if text == "/resume" or text.startswith("/resume "):
