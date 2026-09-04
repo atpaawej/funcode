@@ -1,0 +1,15 @@
+{
+  "provider": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "${OPENAI_API_KEY}",
+    "model": "gpt-4o-mini"
+  },
+  "agent": {
+    "max_turns": 25,
+    "auto_approve": false,
+    "cwd": "."
+  },
+  "web": {
+    "tinyfish_api_key": "${TINYFISH_API_KEY}"
+  }
+}

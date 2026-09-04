@@ -1,0 +1,10 @@
+# local secrets + runtime state (never commit)
+settings.json
+sessions/
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
