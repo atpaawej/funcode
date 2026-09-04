@@ -36,6 +36,7 @@ def _wire_sessions(bus: EventBus, store: SessionStore, session_id: str) -> Sessi
     rec = SessionRecorder(store.path_for(session_id), session_id)
     bus.on("session_start", rec.on_session_start)
     bus.on("message", rec.on_message)
+    bus.on("compact", rec.on_compact)
     return rec
 
 
@@ -171,7 +172,11 @@ def build(args) -> App:
         bus.on("pre_tool_use", gate)
 
     notes = load_agents_md(cwd)
-    loop = AgentLoop(provider, registry, bus, ui, cwd, max_turns, notes, stream=stream)
+    loop = AgentLoop(provider, registry, bus, ui, cwd, max_turns, notes, stream=stream,
+                     context_window=int(a.get("context_window", 0) or 0),
+                     compact_cap=int(a.get("compact_cap", 300_000) or 300_000),
+                     auto_compact_fraction=float(a.get("auto_compact_fraction", 0.85) or 0.85),
+                     compact_keep_last=int(a.get("compact_keep_last", 2)))
     store = SessionStore(cwd)
     store.cleanup()
 
@@ -204,10 +209,24 @@ def build(args) -> App:
               show_history=not args.no_history)
     if resumed is not None:
         _announce_resume(app, *resumed)
-    if args.banner:
+    # Branding: banner by default in interactive REPL; --no-banner hides it,
+    # --banner forces it (also for one-shot).
+    show_banner = getattr(args, "banner", False) or (
+            not getattr(args, "no_banner", False) and not args.prompt)
+    if show_banner:
         ui.banner()
-    ui.startup(model, base_url, settings.get("_source", "?"),
-               str(cwd), registry.names(), auto)
+    if not args.prompt:
+        try:
+            u = loop.context_usage()
+            ui.startup_block(model=model, cwd=str(cwd), tools=registry.names(),
+                             auto=auto, used=u["used"],
+                             window=u["window"], live=bool(loop.messages))
+        except Exception:
+            ui.startup(model, base_url, settings.get("_source", "?"),
+                       str(cwd), registry.names(), auto)
+    else:
+        ui.startup(model, base_url, settings.get("_source", "?"),
+                   str(cwd), registry.names(), auto)
     return app
 
 
@@ -216,11 +235,22 @@ def _after_turn(app: App, user_text: str) -> None:
         app.title = make_title(user_text)
     app.turns += 1
     _touch_index(app)
+    _show_context(app)
+
+
+def _show_context(app: App, detail: bool = False) -> None:
+    try:
+        u = app.loop.context_usage()
+        if detail:
+            app.ui.context_detail(u)
+        else:
+            app.ui.context_bar(u["used"], u["window"])
+    except Exception:
+        pass
 
 
 def repl(app: App) -> None:
     loop, ui = app.loop, app.ui
-    ui.info("REPL — /exit /clear /new /resume [filter] /sessions /history [n] /rename <t> /tools /thinking /verbose.")
     while True:
         try:
             text = ui.prompt().strip()
@@ -270,6 +300,23 @@ def repl(app: App) -> None:
                 ui.info(f"Renamed to '{name}'.")
             else:
                 ui.warn("Usage: /rename <title>")
+            continue
+        if text == "/compact" or text.startswith("/compact "):
+            extra = text[len("/compact"):].strip()
+            try:
+                stats = loop.compact(extra)
+            except Exception as e:
+                ui.warn(f"compact failed: {e}")
+                continue
+            if stats is None:
+                ui.info("Nothing to compact yet.")
+            else:
+                ui.compact_notice(stats.before_tokens, stats.after_tokens,
+                                  stats.kept_tail)
+                _show_context(app)
+            continue
+        if text in ("/context", "/ctx", "/usage"):
+            _show_context(app, detail=True)
             continue
         if text == "/tools":
             ui.info("tools: " + ", ".join(loop.registry.names()))
@@ -331,7 +378,9 @@ def main() -> None:
     ap.add_argument("--no-thinking", action="store_true",
                     help="hide thinking blocks")
     ap.add_argument("--banner", action="store_true",
-                    help="show ASCII banner at startup")
+                    help="show ASCII banner at startup (default in REPL)")
+    ap.add_argument("--no-banner", action="store_true",
+                    help="hide ASCII banner at startup")
     ap.add_argument("--no-stream", action="store_true",
                     help="disable SSE streaming (one-shot fallback)")
     args = ap.parse_args()

@@ -109,6 +109,16 @@ class SessionRecorder:
             entry["tool_call_id"] = payload.get("tool_call_id", "")
             self._write(entry)
 
+    def on_compact(self, payload: dict) -> None:
+        """Persist a compaction checkpoint. Append-only: the loader treats a
+        summary entry as superseding all prior non-system messages."""
+        if not self._materialized:
+            return
+        self._write({"t": _now_iso(), "type": "summary",
+                     "content": payload.get("summary", ""),
+                     "before": payload.get("before", 0),
+                     "after": payload.get("after", 0)})
+
     def close(self, reason: str = "end") -> None:
         if self._materialized:
             self._write({"t": _now_iso(), "type": "session_end", "reason": reason})
@@ -243,7 +253,16 @@ class SessionStore:
                 msgs.append(Message(role="tool", content=e.get("result", "") or "",
                                     tool_call_id=e.get("tool_call_id", "") or "",
                                     tool_name=e.get("name", "") or ""))
-            # session_start/session_end/summary/unknown -> skipped by design
+            elif t == "summary" and isinstance(e.get("content"), str):
+                # Compaction checkpoint: supersedes all prior non-system
+                # messages (append-only log keeps them for forensics).
+                from .compact import SUMMARY_PREFIX
+                body = e["content"]
+                if not body.startswith(SUMMARY_PREFIX):
+                    body = SUMMARY_PREFIX + body
+                msgs = [Message(role="user", content=body)]
+                meta["compactions"] = meta.get("compactions", 0) + 1
+            # session_start/session_end/unknown -> skipped by design
         # Drop a trailing assistant-with-unresolved-tool-calls (interrupted turn):
         while (msgs and msgs[-1].role == "assistant" and msgs[-1].tool_calls
                and not any(m.role == "tool" for m in msgs)):

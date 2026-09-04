@@ -10,7 +10,7 @@ Built with Python + Rich. Any OpenAI-compatible provider via `settings.json`.
 ```bash
 cp settings.example.json settings.json  # set base_url / api_key / model
 uv run funcode "list files and read pyproject.toml"
-uv run funcode          # REPL (/exit, /clear, /tools, /thinking, /verbose)
+uv run funcode          # REPL (/exit, /clear, /tools, /thinking, /verbose, /compact, /context)
 uv run funcode -y "..." # auto-approve write/dangerous tools
 uv run funcode -v "..." # expanded thinking + full tool output
 uv run funcode --no-thinking "..." # hide thinking blocks
@@ -33,7 +33,24 @@ as plain Markdown, tools collapse to two lines (`⏺ Read pyproject.toml` /
 
 - `/thinking [show|hide|full|collapse]` — toggle thinking display (REPL, display only)
 - `/verbose` — expand thinking + full tool output (REPL)
+- `/compact [focus]` — summarize history into one checkpoint, keep last turns
+- `/context` — breakdown (`system · tools · messages`) plus budget line
 - `agent.stream / show_thinking / verbose` in `settings.json` for defaults
+
+## Context
+
+Token use is estimated per turn (tiktoken when installed, else ~chars/4) and
+shown after each reply as `ctx ~used/window (%)`, like OpenCode's
+`30.0K / 200K (15%)`. Like Claude Code's status line, a fresh session shows
+the window only (`128k window`) — live numbers appear once the first API call
+exists. `/context` adds the breakdown (`system · tools · messages`) plus the
+auto-compact threshold, mirroring Claude Code's Autocompact-buffer row.
+Auto-compact fires at
+`auto_compact_fraction × min(context_window, compact_cap)` — default
+`0.85 × min(window, 300k)`, so 1M models compact at ~255k and 128k models at
+~109k. Unknown models default to 128k; override with `agent.context_window`.
+Summaries persist as `summary` checkpoints in the session JSONL, so resume
+replays compacted — not full — history.
 
 ## Architecture
 
