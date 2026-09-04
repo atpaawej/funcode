@@ -1,7 +1,6 @@
 """Minimal ReAct loop. Only talks to abstractions."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +27,8 @@ Grounding (no hallucinating):
 
 class AgentLoop:
     def __init__(self, provider: LLMProvider, registry: ToolRegistry, bus: EventBus,
-                 renderer, cwd: Path, max_turns: int = 25, project_notes: str = ""):
+                 renderer, cwd: Path, max_turns: int = 25, project_notes: str = "",
+                 stream: bool = True):
         self.provider = provider
         self.registry = registry
         self.bus = bus
@@ -36,6 +36,7 @@ class AgentLoop:
         self.cwd = cwd
         self.max_turns = max_turns
         self.project_notes = project_notes
+        self.stream = stream
         self.messages: list[Message] = []
 
     def _system(self) -> str:
@@ -52,42 +53,90 @@ class AgentLoop:
         final = "(no response)"
         for _ in range(self.max_turns):
             self.bus.emit("llm_call", {})
-            with self.ui.thinking():
-                result = self.provider.complete(self.messages, self.registry.defs())
-            if result.reasoning:
-                self.ui.thinking_text(result.reasoning)
-            if not result.tool_calls:
-                self.messages.append(Message(role="assistant", content=result.content))
-                self.bus.emit("message", {"role": "assistant", "content": result.content,
-                                          "reasoning": result.reasoning, "tool_calls": []})
-                self.ui.assistant_text(result.content)
-                final = result.content
+            content, reasoning, tool_calls = self._stream_turn()
+            if not tool_calls:
+                self.messages.append(Message(role="assistant", content=content))
+                self.bus.emit("message", {"role": "assistant", "content": content,
+                                          "reasoning": reasoning, "tool_calls": []})
+                final = content or final
                 break
-            self.messages.append(Message(role="assistant", content=result.content,
-                                         tool_calls=result.tool_calls))
-            self.bus.emit("message", {"role": "assistant", "content": result.content,
-                                      "reasoning": result.reasoning,
+            self.messages.append(Message(role="assistant", content=content,
+                                         tool_calls=tool_calls))
+            self.bus.emit("message", {"role": "assistant", "content": content,
+                                      "reasoning": reasoning,
                                       "tool_calls": [{"id": tc.id, "name": tc.name,
                                                       "arguments": tc.arguments}
-                                                     for tc in result.tool_calls]})
-            if result.content:
-                self.ui.assistant_text(result.content)
-            for tc in result.tool_calls:
+                                                     for tc in tool_calls]})
+            for tc in tool_calls:
                 final = self._run_tool(tc) or final
         else:
             self.ui.warn(f"Stopped after {self.max_turns} turns.")
         self.bus.emit("turn_end", {"output": final})
         return final
 
+    def _stream_turn(self) -> tuple[str, str, list[ToolCall]]:
+        """Consume SSE stream, drive Live renderer. Returns (content, reasoning, calls)."""
+        if not self.stream:
+            return self._oneshot_turn()
+        content_buf, reasoning_buf = "", ""
+        finals: list[ToolCall] = []
+        self.ui.stream_start()
+        try:
+            for ev in self.provider.complete_stream(self.messages, self.registry.defs()):
+                kind = ev.kind
+                if kind == "content":
+                    content_buf += ev.text
+                    self.ui.stream_token(ev.text)
+                elif kind == "reasoning":
+                    reasoning_buf += ev.text
+                    self.ui.stream_reasoning(ev.text)
+                elif kind == "tool_hint":
+                    self.ui.stream_tool_hint(ev.tool_name, ev.args_fragment)
+                elif kind == "tool_final":
+                    try:
+                        import json as _json
+                        args = _json.loads(ev.args_fragment or "{}")
+                    except Exception:
+                        args = {"_raw": ev.args_fragment}
+                    if not isinstance(args, dict):
+                        args = {"_raw": args}
+                    finals.append(ToolCall(id=ev.tool_id or f"call_{len(finals)}",
+                                           name=ev.tool_name, arguments=args))
+                elif kind == "error":
+                    content, reasoning = self.ui.stream_end()
+                    self.ui.warn(f"LLM error: {ev.error}")
+                    return content or content_buf, reasoning or reasoning_buf, []
+                elif kind == "done":
+                    break
+        except KeyboardInterrupt:
+            self.ui.stream_cancel()
+            raise
+        except Exception as e:
+            try:
+                content, reasoning = self.ui.stream_end()
+            except Exception:
+                content, reasoning = content_buf, reasoning_buf
+            self.ui.warn(f"LLM error: {e}")
+            return content, reasoning, []
+        content, reasoning = self.ui.stream_end()
+        return content, reasoning, finals
+
+    def _oneshot_turn(self) -> tuple[str, str, list[ToolCall]]:
+        """Fallback for endpoints without SSE support."""
+        with self.ui.thinking():
+            result = self.provider.complete(self.messages, self.registry.defs())
+        self.ui.thinking_text(result.reasoning)
+        self.ui.assistant_text(result.content)
+        return result.content, result.reasoning, result.tool_calls
+
     def _run_tool(self, tc: ToolCall) -> str:
-        pretty_args = json.dumps(tc.arguments, indent=2)[:2000]
-        self.ui.tool_call(tc.name, pretty_args)
+        self.ui.tool_call(tc.name, tc.arguments)
         try:
             out = self.registry.execute(tc.name, tc.arguments, ToolContext(cwd=self.cwd))
         except ToolBlocked as e:
             out = f"Blocked: {e}. Told user it was not approved."
             self.ui.warn(str(e))
-        self.ui.tool_result(tc.name, out[:4000])
+        self.ui.tool_result(tc.name, out[:4000], tc.arguments)
         self.messages.append(Message(role="tool", content=out,
                                      tool_call_id=tc.id, tool_name=tc.name))
         self.bus.emit("message", {"role": "tool", "name": tc.name, "args": tc.arguments,
