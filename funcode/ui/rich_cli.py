@@ -53,6 +53,54 @@ class RichRenderer:
         console.print(Panel(Text(short, style="dim"), title="[dim]thinking[/dim]",
                             border_style="dim", expand=False))
 
+    def history_user(self, text: str) -> None:
+        console.print(f"[bold cyan]› [/][dim]{text}[/dim]")
+
+    def history_tool(self, name: str, output: str, max_lines: int = 10) -> None:
+        console.print(f"[yellow]⏺ {name}[/yellow]")
+        lines = output.splitlines() or ["(no output)"]
+        if len(lines) > max_lines:
+            body = "\n".join(lines[:max_lines])
+            body += f"\n… ({len(lines) - max_lines} more lines in transcript)"
+        else:
+            body = "\n".join(lines)
+        console.print(Panel(Text(body, style="dim"), title=f"⎿ {name}",
+                            border_style="dim", expand=False))
+
+    def render_history(self, messages, max_turns: int = 5) -> None:
+        """Replay past turns: user echo, assistant panels, collapsed tools.
+        Thinking traces skipped (still in model context). System msgs skipped."""
+        turns: list[list] = []
+        for m in messages:
+            if m.role == "system":
+                continue
+            if m.role == "user":
+                turns.append([m])
+            elif turns:
+                turns[-1].append(m)
+        if not turns:
+            return
+        if len(turns) > max_turns:
+            console.print(f"[dim]… {len(turns) - max_turns} older turns hidden"
+                          " — /history <n> to see more[/dim]")
+        for turn in turns[-max_turns:]:
+            for m in turn:
+                if m.role == "user":
+                    self.history_user(m.content)
+                elif m.role == "assistant":
+                    self.assistant_text(m.content)
+                elif m.role == "tool":
+                    self.history_tool(m.tool_name or "tool", m.content)
+
+    def resume_header(self, title: str, turns: int, age: str,
+                      old_model: str, new_model: str) -> None:
+        console.print(f"[dim]─── resumed '{title}' · {turns} turns · {age} ───[/dim]")
+        if old_model and old_model != new_model:
+            console.print(f"[yellow]! model changed since: {old_model} → {new_model}[/yellow]")
+
+    def resume_footer(self) -> None:
+        console.print("[dim]─── end of history · files may have changed ───[/dim]")
+
     def thinking(self):
         @contextmanager
         def _cm() -> Iterator[None]:

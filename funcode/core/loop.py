@@ -42,10 +42,11 @@ class AgentLoop:
         return BASE_SYSTEM + self.project_notes + f"\n\nWorking directory: {self.cwd}"
 
     def run(self, user_text: str) -> str:
-        self.bus.emit("session_start", {"cwd": str(self.cwd)})
+        self.bus.emit("session_start", {"cwd": str(self.cwd), "model": self.provider.model})
         if not any(m.role == "system" for m in self.messages):
             self.messages.insert(0, Message(role="system", content=self._system()))
         self.messages.append(Message(role="user", content=user_text))
+        self.bus.emit("message", {"role": "user", "content": user_text})
         self.bus.emit("turn_start", {"input": user_text})
 
         final = "(no response)"
@@ -57,11 +58,18 @@ class AgentLoop:
                 self.ui.thinking_text(result.reasoning)
             if not result.tool_calls:
                 self.messages.append(Message(role="assistant", content=result.content))
+                self.bus.emit("message", {"role": "assistant", "content": result.content,
+                                          "reasoning": result.reasoning, "tool_calls": []})
                 self.ui.assistant_text(result.content)
                 final = result.content
                 break
             self.messages.append(Message(role="assistant", content=result.content,
                                          tool_calls=result.tool_calls))
+            self.bus.emit("message", {"role": "assistant", "content": result.content,
+                                      "reasoning": result.reasoning,
+                                      "tool_calls": [{"id": tc.id, "name": tc.name,
+                                                      "arguments": tc.arguments}
+                                                     for tc in result.tool_calls]})
             if result.content:
                 self.ui.assistant_text(result.content)
             for tc in result.tool_calls:
@@ -82,7 +90,13 @@ class AgentLoop:
         self.ui.tool_result(tc.name, out[:4000])
         self.messages.append(Message(role="tool", content=out,
                                      tool_call_id=tc.id, tool_name=tc.name))
+        self.bus.emit("message", {"role": "tool", "name": tc.name, "args": tc.arguments,
+                                  "result": out, "tool_call_id": tc.id})
         return out
+
+    def load_history(self, messages: list[Message]) -> None:
+        """Preload replayed transcript (resume). System prompt stays fresh."""
+        self.messages = [m for m in messages if m.role != "system"]
 
     def reset(self) -> None:
         self.messages = []
