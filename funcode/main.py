@@ -142,9 +142,20 @@ def build(args) -> App:
     cwd = Path(args.cwd or a.get("cwd", ".")).resolve()
     max_turns = args.max_turns or int(a.get("max_turns", 25))
     auto = args.yes or bool(a.get("auto_approve", False))
+    verbose = bool(args.verbose or a.get("verbose", False))
+    # show_thinking: --no-thinking hides, --thinking forces collapsed show, default on.
+    if args.no_thinking:
+        show_thinking = False
+    elif args.thinking:
+        show_thinking = True
+    else:
+        show_thinking = bool(a.get("show_thinking", True))
+    if verbose:
+        show_thinking = True
+    stream = (not args.no_stream) and bool(a.get("stream", True))
 
     bus = EventBus()
-    ui = RichRenderer()
+    ui = RichRenderer(verbose=verbose, show_thinking=show_thinking)
     registry = ToolRegistry(bus)
     registry.add_provider(BuiltinProvider())
     registry.add_provider(WebProvider(tinyfish_api_key=w.get("tinyfish_api_key", "")))
@@ -160,7 +171,7 @@ def build(args) -> App:
         bus.on("pre_tool_use", gate)
 
     notes = load_agents_md(cwd)
-    loop = AgentLoop(provider, registry, bus, ui, cwd, max_turns, notes)
+    loop = AgentLoop(provider, registry, bus, ui, cwd, max_turns, notes, stream=stream)
     store = SessionStore(cwd)
     store.cleanup()
 
@@ -193,6 +204,8 @@ def build(args) -> App:
               show_history=not args.no_history)
     if resumed is not None:
         _announce_resume(app, *resumed)
+    if args.banner:
+        ui.banner()
     ui.startup(model, base_url, settings.get("_source", "?"),
                str(cwd), registry.names(), auto)
     return app
@@ -207,7 +220,7 @@ def _after_turn(app: App, user_text: str) -> None:
 
 def repl(app: App) -> None:
     loop, ui = app.loop, app.ui
-    ui.info("REPL — /exit /clear /new /resume [filter] /sessions /history [n] /rename <t> /tools.")
+    ui.info("REPL — /exit /clear /new /resume [filter] /sessions /history [n] /rename <t> /tools /thinking /verbose.")
     while True:
         try:
             text = ui.prompt().strip()
@@ -261,6 +274,31 @@ def repl(app: App) -> None:
         if text == "/tools":
             ui.info("tools: " + ", ".join(loop.registry.names()))
             continue
+        if text == "/thinking" or text.startswith("/thinking "):
+            arg = text[len("/thinking"):].strip().lower()
+            if arg in ("show", "on"):
+                ui.set_show_thinking(True)
+            elif arg in ("hide", "off"):
+                ui.set_show_thinking(False)
+            elif arg in ("full", "expand", "verbose"):
+                ui.set_show_thinking(True)
+                ui.set_verbose(True)
+            elif arg in ("collapse", "collapsed"):
+                ui.set_verbose(False)
+            elif arg == "":
+                ui.toggle_thinking()
+            else:
+                ui.warn("Usage: /thinking [show|hide|full|collapse]")
+                continue
+            state = "shown (collapsed)" if ui.show_thinking and not ui.verbose else \
+                "expanded" if ui.show_thinking else "hidden"
+            ui.info(f"thinking {state}.")
+            continue
+        if text == "/verbose":
+            ui.set_show_thinking(True)
+            ui.set_verbose(not ui.verbose)
+            ui.info(f"verbose {'on' if ui.verbose else 'off'}.")
+            continue
         try:
             loop.run(text)
             _after_turn(app, text)
@@ -286,6 +324,16 @@ def main() -> None:
                     help="resume the most recent session")
     ap.add_argument("--no-history", action="store_true",
                     help="skip printing previous turns on resume")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="expand thinking + full tool output")
+    ap.add_argument("--thinking", action="store_true",
+                    help="show thinking (collapsed)")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="hide thinking blocks")
+    ap.add_argument("--banner", action="store_true",
+                    help="show ASCII banner at startup")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="disable SSE streaming (one-shot fallback)")
     args = ap.parse_args()
 
     try:

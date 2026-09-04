@@ -1,14 +1,25 @@
-"""Rich CLI renderer. Loop depends on this interface, not on Rich directly."""
+"""Rich CLI renderer. Loop depends on this interface, not on Rich directly.
+
+Clean-A + SSE streaming:
+- assistant text = plain Markdown, no panels
+- tools = 2 compact lines (⏺ call / ⎿ result) via summaries.py
+- thinking = collapsed by default (1 dim line), expand with verbose//thinking
+- streaming = single Live region, throttled MD preview with fence guard
+"""
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Any, Iterator
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.text import Text
+
+from .summaries import format_call, format_result
 
 console = Console()
 
@@ -23,8 +34,64 @@ BRAND = r"""
 
 TAGLINE = "personal extensible agent · v0 — small core, big seams"
 
+# Throttle live MD re-renders (Markdown parse each token is wasteful).
+_LIVE_MIN_INTERVAL = 0.12
+# Expanded reasoning preview cap while streaming (full text kept for transcript).
+_REASON_PREVIEW = 800
+
+
+def _frag_args(name: str, frag: str) -> dict:
+    """Best-effort args from a partial JSON shard. Falls back to regex so the
+    live hint shows e.g. Read pyproject… instead of Read … mid-stream."""
+    if frag:
+        try:
+            import json as _json
+            args = _json.loads(frag)
+            if isinstance(args, dict):
+                return args
+        except Exception:
+            pass
+        import re as _re
+        for key in ("path", "command", "query", "pattern", "url"):
+            m = _re.search(r'"' + key + r'"\s*:\s*"([^"\\]*)', frag)
+            if m:
+                return {key: m.group(1) + "…"}
+    return {}
+
+
+def _preview_md(buf: str) -> str:
+    """Fence guard: close an unclosed ``` block + cursor for live preview."""
+    if buf.count("```") % 2 == 1:
+        return buf + "\n```\n▍"
+    return buf + "▍" if buf and not buf.endswith("\n") else buf
+
 
 class RichRenderer:
+    def __init__(self, verbose: bool = False, show_thinking: bool = True):
+        # verbose = expanded reasoning (full stream); show_thinking = collapsed line.
+        self.verbose = verbose
+        self.show_thinking = show_thinking
+        # --- streaming state ---
+        self._live: Live | None = None
+        self._content = ""
+        self._reasoning = ""
+        self._hints: list[str] = []
+        self._t0 = 0.0
+        self._last_update = 0.0
+        self._streaming = False
+
+    # -- settings -----------------------------------------------------
+    def set_verbose(self, v: bool) -> None:
+        self.verbose = v
+
+    def set_show_thinking(self, v: bool) -> None:
+        self.show_thinking = v
+
+    def toggle_thinking(self) -> bool:
+        self.show_thinking = not self.show_thinking
+        return self.show_thinking
+
+    # -- startup ------------------------------------------------------
     def banner(self, subtitle: str = "") -> None:
         art = Text(BRAND, style="bold cyan")
         console.print(art)
@@ -34,24 +101,25 @@ class RichRenderer:
 
     def startup(self, model: str, base_url: str, settings_src: str,
                 cwd: str, tools: list[str], auto: bool) -> None:
-        self.banner()
-        body = (
-            f"[cyan]model[/cyan]    {model}\n"
-            f"[cyan]endpoint[/cyan] {base_url}\n"
-            f"[cyan]settings[/cyan] {settings_src}\n"
-            f"[cyan]cwd[/cyan]      {cwd}\n"
-            f"[cyan]tools[/cyan]    {', '.join(tools)}\n"
-            f"[cyan]approvals[/cyan] {'OFF — auto-approve' if auto else 'ON for write/dangerous'}"
+        console.print(
+            f"[dim]funcode · {model} · {len(tools)} tools · "
+            f"{'auto-approve' if auto else 'approvals on'} · {cwd}[/dim]"
         )
-        console.print(Panel(body, title="[bold]funcode[/bold]", border_style="cyan", expand=False))
 
+    # -- non-streaming fallbacks (history, errors, one-shot) ----------
     def thinking_text(self, text: str) -> None:
+        if not self.show_thinking:
+            return
         text = text.strip()
         if not text:
             return
+        if not self.verbose:
+            n = len(text.splitlines())
+            console.print(f"[dim italic]⋯ thought · {n} lines — /thinking to expand[/dim italic]")
+            return
         short = text if len(text) <= 3000 else text[:3000] + "\n…[truncated]"
-        console.print(Panel(Text(short, style="dim"), title="[dim]thinking[/dim]",
-                            border_style="dim", expand=False))
+        console.print(Panel(Text(short, style="dim italic"),
+                            title="[dim]thinking[/dim]", border_style="dim", expand=False))
 
     def history_user(self, text: str) -> None:
         console.print(f"[bold cyan]› [/][dim]{text}[/dim]")
@@ -68,8 +136,6 @@ class RichRenderer:
                             border_style="dim", expand=False))
 
     def render_history(self, messages, max_turns: int = 5) -> None:
-        """Replay past turns: user echo, assistant panels, collapsed tools.
-        Thinking traces skipped (still in model context). System msgs skipped."""
         turns: list[list] = []
         for m in messages:
             if m.role == "system":
@@ -90,7 +156,9 @@ class RichRenderer:
                 elif m.role == "assistant":
                     self.assistant_text(m.content)
                 elif m.role == "tool":
-                    self.history_tool(m.tool_name or "tool", m.content)
+                    summary, _ = format_result(m.tool_name or "tool", None, m.content)
+                    console.print(f"[yellow]⏺ {m.tool_name or 'tool'}[/yellow]")
+                    console.print(f"[dim]⎿ {summary}[/dim]")
 
     def resume_header(self, title: str, turns: int, age: str,
                       old_model: str, new_model: str) -> None:
@@ -110,15 +178,129 @@ class RichRenderer:
 
     def assistant_text(self, text: str) -> None:
         if text.strip():
-            console.print(Panel(Markdown(text), title="funcode", border_style="cyan", expand=False))
+            console.print(Markdown(text))
 
-    def tool_call(self, name: str, args: str) -> None:
-        console.print(f"[yellow]⏺ {name}[/yellow][dim]{(' ' + args) if args else ''}[/dim]")
+    # -- compact tool lines (non-stream path) -------------------------
+    def tool_call(self, name: str, args: Any) -> None:
+        label = format_call(name, args if isinstance(args, dict) else {})
+        suffix = "" if isinstance(args, dict) else (f" {args}" if args else "")
+        console.print(f"[yellow]⏺ {label}[/yellow][dim]{suffix}[/dim]")
 
-    def tool_result(self, name: str, output: str) -> None:
-        short = output if len(output) <= 1200 else output[:1200] + "\n…[truncated]"
-        console.print(Panel(short, title=f"⎿ {name}", border_style="dim", expand=False))
+    def tool_result(self, name: str, output: str, args: Any = None) -> None:
+        summary, is_err = format_result(
+            name, args if isinstance(args, dict) else None, output)
+        style = "red" if is_err else "dim"
+        console.print(f"[{style}]⎿ {summary}[/{style}]")
+        if self.verbose and output.strip():
+            lines = output.splitlines()[:20]
+            console.print(Panel(Text("\n".join(lines), style="dim"),
+                                title=f"⎿ {name}", border_style="dim", expand=False))
 
+    # -- streaming ----------------------------------------------------
+    def stream_start(self) -> None:
+        self._content = ""
+        self._reasoning = ""
+        self._hints = []
+        self._t0 = time.monotonic()
+        self._last_update = 0.0
+        self._streaming = True
+        self._live = Live(self._render_stream(), console=console,
+                          refresh_per_second=8, transient=True)
+        self._live.start()
+
+    def stream_reasoning(self, text: str) -> None:
+        if not text:
+            return
+        self._reasoning += text
+        self._maybe_update(force=False)
+
+    def stream_token(self, text: str) -> None:
+        if not text:
+            return
+        self._content += text
+        self._maybe_update(force="\n" in text)
+
+    def stream_tool_hint(self, name: str, args_frag: str = "") -> None:
+        args = _frag_args(name, args_frag)
+        label = format_call(name, args)
+        if label not in self._hints:
+            self._hints.append(label)
+        self._maybe_update(force=True)
+
+    def stream_end(self) -> tuple[str, str]:
+        """Stop Live, print final clean blocks. Returns (content, reasoning)."""
+        content, reasoning = self._content, self._reasoning
+        elapsed = time.monotonic() - self._t0 if self._t0 else 0.0
+        if self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+        self._streaming = False
+        # collapsed thinking footer (1 line); expanded only when verbose
+        if reasoning.strip() and self.show_thinking:
+            n = len(reasoning.splitlines()) or 1
+            if self.verbose:
+                short = reasoning if len(reasoning) <= 3000 else reasoning[:3000] + "\n…[truncated]"
+                console.print(Panel(Text(short, style="dim italic"),
+                                    title="[dim]thinking[/dim]",
+                                    border_style="dim", expand=False))
+            else:
+                console.print(
+                    f"[dim italic]⋯ thought for {elapsed:.0f}s · {n} lines"
+                    " — /thinking to expand[/dim italic]")
+        if content.strip():
+            console.print(Markdown(content))
+        self._content, self._reasoning, self._hints = "", "", []
+        return content, reasoning
+
+    def stream_cancel(self) -> tuple[str, str]:
+        if self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+        self._streaming = False
+        content, reasoning = self._content, self._reasoning
+        self._content, self._reasoning, self._hints = "", "", []
+        return content, reasoning
+
+    # -- internals ----------------------------------------------------
+    def _maybe_update(self, force: bool = False) -> None:
+        if self._live is None:
+            return
+        now = time.monotonic()
+        if force or (now - self._last_update) >= _LIVE_MIN_INTERVAL:
+            self._last_update = now
+            try:
+                self._live.update(self._render_stream())
+            except Exception:
+                pass
+
+    def _render_stream(self) -> Group:
+        parts: list[Any] = []
+        if self._reasoning and self.show_thinking and not self._content and not self._hints:
+            if self.verbose:
+                preview = self._reasoning[-_REASON_PREVIEW:]
+                parts.append(Text("⋯ thinking…", style="dim italic"))
+                parts.append(Text(preview, style="dim italic"))
+            else:
+                n = len(self._reasoning.splitlines()) or 1
+                parts.append(Text(f"◐ thinking… ({n} lines)", style="dim italic"))
+        if self._content:
+            try:
+                parts.append(Markdown(_preview_md(self._content)))
+            except Exception:
+                parts.append(Text(self._content + "▍"))
+        elif not parts:
+            parts.append(Text("◐ …", style="dim"))
+        for h in self._hints[-3:]:
+            parts.append(Text(f"⏺ {h}", style="yellow"))
+        return Group(*parts)
+
+    # -- misc ---------------------------------------------------------
     def warn(self, text: str) -> None:
         console.print(f"[red]{text}[/red]")
 
