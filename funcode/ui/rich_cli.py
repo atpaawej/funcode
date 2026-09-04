@@ -106,6 +106,39 @@ class RichRenderer:
             f"{'auto-approve' if auto else 'approvals on'} · {cwd}[/dim]"
         )
 
+    def startup_block(self, *, model: str, cwd: str, tools: list[str], auto: bool,
+                      used: int, window: int, live: bool) -> None:
+        """Organized REPL header: aligned status rows + grouped commands.
+
+        live=False (no API call yet, like Claude Code's null current_usage):
+        show the window reference only, no usage number."""
+        from ..core.tokens import format_k
+        pct = (used / window * 100) if window else 0.0
+        console.print(f"[dim]model    [/dim]{model}")
+        console.print(f"[dim]tools    [/dim]{len(tools)} · {', '.join(tools)}")
+        console.print(f"[dim]mode     [/dim]{'auto-approve' if auto else 'approvals on'}")
+        console.print(f"[dim]cwd      [/dim]{cwd}")
+        if live:
+            console.print(f"[dim]context  [/dim]~{format_k(used)}/{format_k(window)}"
+                          f" ({pct:.0f}%)")
+        else:
+            console.print(f"[dim]context  [/dim]{format_k(window)} window")
+        console.print()
+        console.print("[dim]session   [/dim][dim]/new /resume /sessions /history /rename[/dim]")
+        console.print("[dim]agent     [/dim][dim]/compact /context /tools /thinking /verbose[/dim]")
+        console.print("[dim]general   [/dim][dim]/clear /exit[/dim]")
+
+    def context_detail(self, usage: dict) -> None:
+        """Claude-style breakdown: where the tokens actually go, plus the
+        auto-compact threshold (its only visible home)."""
+        from ..core.tokens import format_k
+        self.context_bar(usage["used"], usage["window"])
+        console.print(f"[dim]  system    ~{format_k(usage['system_tokens'])}"
+                      f"  ·  tools  ~{format_k(usage['tools_tokens'])}"
+                      f" ({usage['n_tools']})"
+                      f"  ·  messages  ~{format_k(usage['messages_tokens'])}[/dim]")
+        console.print(f"[dim]  auto-compact at ~{format_k(usage['trigger_at'])}[/dim]")
+
     # -- non-streaming fallbacks (history, errors, one-shot) ----------
     def thinking_text(self, text: str) -> None:
         if not self.show_thinking:
@@ -303,6 +336,32 @@ class RichRenderer:
     # -- misc ---------------------------------------------------------
     def warn(self, text: str) -> None:
         console.print(f"[red]{text}[/red]")
+
+    def context_bar(self, used: int, window: int) -> None:
+        """Ambient budget line (statusline-style): used vs window only.
+        The auto-compact threshold lives in /context detail, like Claude
+        Code's Autocompact-buffer row — never in the ambient display."""
+        from ..core.tokens import format_k
+        pct = (used / window * 100) if window else 0.0
+        left = max(0, window - used)
+        if pct >= 100:
+            style = "red"
+        elif pct >= 80:
+            style = "yellow"
+        else:
+            style = "dim"
+        console.print(
+            f"[{style}]ctx ~{format_k(used)}/{format_k(window)}"
+            f" ({pct:.0f}%) · {format_k(left)} left[/{style}]"
+        )
+
+    def compact_notice(self, before: int, after: int, kept_tail: int, auto: bool = False) -> None:
+        from ..core.tokens import format_k
+        kind = "Auto-compacted" if auto else "Compacted"
+        console.print(
+            f"[green]{kind}: ~{format_k(before)} → ~{format_k(after)}"
+            f" · kept last {kept_tail} turn(s) + summary[/green]"
+        )
 
     def info(self, text: str) -> None:
         console.print(f"[dim]{text}[/dim]")

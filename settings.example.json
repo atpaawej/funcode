@@ -10,7 +10,11 @@
     "cwd": ".",
     "stream": true,
     "show_thinking": true,
-    "verbose": false
+    "verbose": false,
+    "context_window": 0,
+    "compact_cap": 300000,
+    "auto_compact_fraction": 0.85,
+    "compact_keep_last": 2
   },
   "web": {
     "tinyfish_api_key": "${TINYFISH_API_KEY}"

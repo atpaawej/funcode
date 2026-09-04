@@ -4,8 +4,23 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .compact import (
+    CompactStats,
+    apply_compaction,
+    build_summary_messages,
+    split_for_compact,
+)
 from .events import EventBus, ToolBlocked
 from .provider import LLMProvider
+from .tokens import (
+    DEFAULT_CAP,
+    DEFAULT_FRACTION,
+    compact_trigger_at,
+    count_messages_tokens,
+    effective_budget,
+    estimate_text_tokens,
+    resolve_window,
+)
 from .tools import ToolContext, ToolRegistry
 from .types import Message, ToolCall
 
@@ -28,7 +43,10 @@ Grounding (no hallucinating):
 class AgentLoop:
     def __init__(self, provider: LLMProvider, registry: ToolRegistry, bus: EventBus,
                  renderer, cwd: Path, max_turns: int = 25, project_notes: str = "",
-                 stream: bool = True):
+                 stream: bool = True, context_window: int = 0,
+                 compact_cap: int = DEFAULT_CAP,
+                 auto_compact_fraction: float = DEFAULT_FRACTION,
+                 compact_keep_last: int = 2):
         self.provider = provider
         self.registry = registry
         self.bus = bus
@@ -38,9 +56,65 @@ class AgentLoop:
         self.project_notes = project_notes
         self.stream = stream
         self.messages: list[Message] = []
+        self.context_window_override = max(0, int(context_window or 0))
+        self.compact_cap = int(compact_cap or DEFAULT_CAP)
+        self.auto_compact_fraction = float(auto_compact_fraction or DEFAULT_FRACTION)
+        self.compact_keep_last = max(0, int(compact_keep_last))
 
     def _system(self) -> str:
         return BASE_SYSTEM + self.project_notes + f"\n\nWorking directory: {self.cwd}"
+
+    def context_usage(self) -> dict:
+        """Current prompt-token estimate + budget. Keys: used, window, source,
+        budget, trigger_at, remaining, pct, plus breakdown keys
+        system_tokens / tools_tokens / messages_tokens.
+
+        Full-cost counting (like Claude Code / OpenCode): the system prompt is
+        counted even before it is lazily inserted, since it WILL be sent."""
+        window, source = resolve_window(self.provider.model, self.context_window_override)
+        budget = effective_budget(window, self.compact_cap)
+        trigger = compact_trigger_at(budget, self.auto_compact_fraction)
+        model = self.provider.model
+        defs = self.registry.defs()
+        tools_tokens = count_messages_tokens([], model, defs)
+        system_msgs = [m for m in self.messages if m.role == "system"]
+        if system_msgs:
+            system_tokens = count_messages_tokens(system_msgs, model)
+        else:
+            system_tokens = estimate_text_tokens(self._system(), model) + 4
+        messages_tokens = count_messages_tokens(
+            [m for m in self.messages if m.role != "system"], model)
+        used = system_tokens + tools_tokens + messages_tokens
+        return {"used": used, "window": window, "source": source, "budget": budget,
+                "trigger_at": trigger, "remaining": max(0, trigger - used),
+                "pct": (used / trigger * 100) if trigger else 0.0,
+                "system_tokens": system_tokens, "tools_tokens": tools_tokens,
+                "messages_tokens": messages_tokens, "n_tools": len(defs)}
+
+    def compact(self, extra: str = "") -> CompactStats | None:
+        """Summarize head, replace with summary message. Returns stats or None."""
+        head, tail = split_for_compact(self.messages, self.compact_keep_last)
+        if not head:
+            return None
+        with self.ui.thinking():
+            result = self.provider.complete(build_summary_messages(head, extra), [])
+        summary = (result.content or "").strip() or "(empty summary)"
+        self.messages, stats = apply_compaction(
+            self.messages, tail, summary, self.provider.model)
+        self.bus.emit("compact", {"summary": summary, "before": stats.before_tokens,
+                                  "after": stats.after_tokens, "kept_tail": stats.kept_tail})
+        return stats
+
+    def maybe_auto_compact(self) -> CompactStats | None:
+        """Compact when estimate >= trigger. Returns stats if compacted."""
+        usage = self.context_usage()
+        if usage["used"] < usage["trigger_at"]:
+            return None
+        stats = self.compact()
+        if stats is not None:
+            self.ui.compact_notice(stats.before_tokens, stats.after_tokens,
+                                    stats.kept_tail, auto=True)
+        return stats
 
     def run(self, user_text: str) -> str:
         self.bus.emit("session_start", {"cwd": str(self.cwd), "model": self.provider.model})
@@ -52,6 +126,7 @@ class AgentLoop:
 
         final = "(no response)"
         for _ in range(self.max_turns):
+            self.maybe_auto_compact()
             self.bus.emit("llm_call", {})
             content, reasoning, tool_calls = self._stream_turn()
             if not tool_calls:
