@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import argparse
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .commands import CommandContext, CommandRegistry, split_command
+from .commands.builtin import (
+    BuiltinProvider as BuiltinCommands,
+    _act_help_detail,
+    _do_resume,
+    _pick_session,
+    _touch_index,
+)
+from .commands.markdown import build_file_providers
+from .commands.providers_cmd import ProvidersProvider
 from .config import load_settings
 from .context.agents_md import load_agents_md
 from .core.events import EventBus
@@ -28,6 +37,8 @@ class App:
     session_id: str
     title: str
     model: str
+    settings: dict
+    cmd_registry: CommandRegistry | None = None
     turns: int = 0
     show_history: bool = True
 
@@ -38,93 +49,6 @@ def _wire_sessions(bus: EventBus, store: SessionStore, session_id: str) -> Sessi
     bus.on("message", rec.on_message)
     bus.on("compact", rec.on_compact)
     return rec
-
-
-def _touch_index(app: App) -> None:
-    # Lazy sessions (no user message yet) leave no trace: no file, no index row.
-    if app.turns == 0 and not app.recorder.materialized:
-        return
-    app.store.upsert(app.session_id, app.title, app.model, app.turns)
-
-
-def _session_age(app: App, session_id: str) -> str:
-    for d in app.store.list_sessions():
-        if d["id"] == session_id:
-            return _age(d.get("updated", 0))
-    try:
-        return _age(app.store.path_for(session_id).stat().st_mtime)
-    except OSError:
-        return "unknown age"
-
-
-def _announce_resume(app: App, msgs: list, meta: dict) -> None:
-    age = _session_age(app, app.session_id)
-    app.ui.resume_header(app.title, app.turns, age, meta.get("model", ""), app.model)
-    if app.show_history:
-        app.ui.render_history(msgs)
-        app.ui.resume_footer()
-
-
-def _do_resume(app: App, session_id: str) -> bool:
-    msgs, meta = app.store.load_messages(session_id)
-    if not msgs:
-        app.ui.warn(f"No transcript found for '{session_id}'.")
-        return False
-    app.recorder.close("switch")
-    _touch_index(app)
-    app.loop.load_history(msgs)
-    app.session_id = session_id
-    app.title = meta.get("title") or session_id
-    app.turns = meta.get("turns", 0)
-    app.recorder = _wire_sessions(app.loop.bus, app.store, session_id)
-    _announce_resume(app, msgs, meta)
-    return True
-
-
-def _new_session(app: App) -> None:
-    app.recorder.close("new")
-    _touch_index(app)
-    app.loop.reset()
-    app.session_id = new_session_id()
-    app.title = "untitled"
-    app.turns = 0
-    app.recorder = _wire_sessions(app.loop.bus, app.store, app.session_id)
-    app.ui.info(f"New session {app.session_id}. Previous one saved.")
-
-
-def _pick_session(app: App, filt: str = "") -> str | None:
-    sessions = app.store.list_sessions()
-    if filt:
-        q = filt.lower()
-        sessions = [d for d in sessions
-                    if q in d.get("title", "").lower() or q in d["id"].lower()]
-    sessions = [d for d in sessions if d["id"] != app.session_id][:15]
-    if not sessions:
-        app.ui.warn("No other sessions found.")
-        return None
-    app.ui.info("Sessions (recent first):")
-    for i, d in enumerate(sessions, 1):
-        age = _age(d.get("updated", 0))
-        app.ui.info(f"  {i}. {d.get('title', d['id'])}  ·  {age}  ·  {d.get('turns', 0)} turns")
-    try:
-        raw = console.input("[bold cyan]resume # (or Enter to cancel) [/]").strip()
-    except (KeyboardInterrupt, EOFError):
-        return None
-    if not raw:
-        return None
-    if raw.isdigit() and 1 <= int(raw) <= len(sessions):
-        return sessions[int(raw) - 1]["id"]
-    found = app.store.find(raw)
-    return found["id"] if found else None
-
-
-def _age(ts: float) -> str:
-    dt = time.time() - ts
-    if dt < 3600:
-        return f"{int(dt // 60)}m ago"
-    if dt < 86400:
-        return f"{int(dt // 3600)}h ago"
-    return f"{int(dt // 86400)}d ago"
 
 
 def build(args) -> App:
@@ -161,6 +85,14 @@ def build(args) -> App:
     registry.add_provider(BuiltinProvider())
     registry.add_provider(WebProvider(tinyfish_api_key=w.get("tinyfish_api_key", "")))
     provider = OpenAICompatProvider(base_url=base_url, api_key=api_key, model=model)
+
+    # Slash commands: builtin actions first (lowest priority), then the
+    # /providers showcase, then file-based tiers low→high so project wins.
+    cregistry = CommandRegistry()
+    cregistry.add_provider(BuiltinCommands())
+    cregistry.add_provider(ProvidersProvider())
+    for fp in build_file_providers(cwd):
+        cregistry.add_provider(fp)
 
     if not auto:
         def gate(payload: dict):
@@ -206,6 +138,7 @@ def build(args) -> App:
     app = App(loop=loop, ui=ui, store=store,
               recorder=_wire_sessions(bus, store, session_id),
               session_id=session_id, title=title, model=model, turns=turns,
+              settings=settings, cmd_registry=cregistry,
               show_history=not args.no_history)
     if resumed is not None:
         _announce_resume(app, *resumed)
@@ -218,9 +151,13 @@ def build(args) -> App:
     if not args.prompt:
         try:
             u = loop.context_usage()
+            custom = [c.name for c in cregistry.list_all()
+                      if not c.source.startswith("builtin")
+                      and c.source not in ("builtin", "providers")]
             ui.startup_block(model=model, cwd=str(cwd), tools=registry.names(),
                              auto=auto, used=u["used"],
-                             window=u["window"], live=bool(loop.messages))
+                             window=u["window"], live=bool(loop.messages),
+                             custom_commands=custom)
         except Exception:
             ui.startup(model, base_url, settings.get("_source", "?"),
                        str(cwd), registry.names(), auto)
@@ -249,102 +186,66 @@ def _show_context(app: App, detail: bool = False) -> None:
         pass
 
 
+def _dispatch_command(app: App, text: str) -> bool:
+    """Run one slash command. Returns True when the REPL should exit."""
+    name, raw = split_command(text)
+    cmd = app.cmd_registry.get(name) if app.cmd_registry is not None else None
+    if cmd is None:
+        app.ui.warn(f"Unknown command '/{name}'. Type /help.")
+        return False
+    ctx = CommandContext(cwd=app.loop.cwd, raw_args=raw, app=app,
+                         extra={"registry": app.cmd_registry})
+    if cmd.is_action:
+        if cmd.name == "help" and raw.strip():
+            _act_help_detail(ctx)
+            return False
+        if cmd.name in ("exit", "quit"):
+            return True
+        try:
+            if cmd.action is not None:
+                cmd.action(ctx)
+        except (KeyboardInterrupt, EOFError):
+            app.ui.info("cancelled.")
+        except Exception as e:
+            app.ui.warn(f"error: {e}")
+        return False
+    # PROMPT command: expand template, run through the loop with provenance.
+    assert app.cmd_registry is not None
+    expanded = app.cmd_registry.expand(cmd, raw, app.loop.cwd)
+    try:
+        app.loop.run(f"[command /{cmd.name}]\n{expanded}")
+        _after_turn(app, text)
+    except (KeyboardInterrupt, EOFError):
+        raise
+    except Exception as e:
+        app.ui.warn(f"error: {e}")
+    return False
+
+
 def repl(app: App) -> None:
     loop, ui = app.loop, app.ui
     while True:
         try:
-            text = ui.prompt().strip()
+            if app.cmd_registry is not None:
+                app.cmd_registry.reload()
+                descs = {c.name: (c.description or "", c.source)
+                         for c in app.cmd_registry.list_all()}
+                text = ui.prompt(commands=descs, cwd=loop.cwd).strip()
+            else:
+                text = ui.prompt().strip()
         except (KeyboardInterrupt, EOFError):
             break
         if not text:
             continue
-        if text in ("/exit", "/quit"):
-            break
-        if text in ("/clear", "/new"):
-            _new_session(app)
-            continue
-        if text == "/sessions":
-            others = [d for d in app.store.list_sessions() if d["id"] != app.session_id][:15]
-            if not others:
-                ui.info("No other sessions.")
-                continue
-            for d in others:
-                ui.info(f"  {d.get('title', d['id'])}  ·  {_age(d.get('updated', 0))}"
-                        f"  ·  {d.get('turns', 0)} turns")
-            continue
-        if text == "/resume" or text.startswith("/resume "):
-            filt = text[len("/resume"):].strip()
-            if filt:
-                found = app.store.find(filt)
-                if found and _do_resume(app, found["id"]):
-                    continue
-                ui.warn(f"No session matching '{filt}'.")
-                continue
-            sid = _pick_session(app)
-            if sid:
-                _do_resume(app, sid)
-            continue
-        if text == "/history" or text.startswith("/history "):
-            arg = text[len("/history"):].strip()
+        if text.startswith("/"):
             try:
-                n = int(arg) if arg else 5
-            except ValueError:
-                ui.warn("Usage: /history [n]")
-                continue
-            ui.render_history(loop.messages, max_turns=max(1, n))
-            continue
-        if text.startswith("/rename"):
-            name = text[len("/rename"):].strip()
-            if name and app.store.rename(app.session_id, name):
-                app.title = name
-                ui.info(f"Renamed to '{name}'.")
-            else:
-                ui.warn("Usage: /rename <title>")
-            continue
-        if text == "/compact" or text.startswith("/compact "):
-            extra = text[len("/compact"):].strip()
-            try:
-                stats = loop.compact(extra)
+                if _dispatch_command(app, text):
+                    break
+            except (KeyboardInterrupt, EOFError):
+                ui.info("interrupted.")
+                break
             except Exception as e:
-                ui.warn(f"compact failed: {e}")
-                continue
-            if stats is None:
-                ui.info("Nothing to compact yet.")
-            else:
-                ui.compact_notice(stats.before_tokens, stats.after_tokens,
-                                  stats.kept_tail)
-                _show_context(app)
-            continue
-        if text in ("/context", "/ctx", "/usage"):
-            _show_context(app, detail=True)
-            continue
-        if text == "/tools":
-            ui.info("tools: " + ", ".join(loop.registry.names()))
-            continue
-        if text == "/thinking" or text.startswith("/thinking "):
-            arg = text[len("/thinking"):].strip().lower()
-            if arg in ("show", "on"):
-                ui.set_show_thinking(True)
-            elif arg in ("hide", "off"):
-                ui.set_show_thinking(False)
-            elif arg in ("full", "expand", "verbose"):
-                ui.set_show_thinking(True)
-                ui.set_verbose(True)
-            elif arg in ("collapse", "collapsed"):
-                ui.set_verbose(False)
-            elif arg == "":
-                ui.toggle_thinking()
-            else:
-                ui.warn("Usage: /thinking [show|hide|full|collapse]")
-                continue
-            state = "shown (collapsed)" if ui.show_thinking and not ui.verbose else \
-                "expanded" if ui.show_thinking else "hidden"
-            ui.info(f"thinking {state}.")
-            continue
-        if text == "/verbose":
-            ui.set_show_thinking(True)
-            ui.set_verbose(not ui.verbose)
-            ui.info(f"verbose {'on' if ui.verbose else 'off'}.")
+                ui.warn(f"error: {e}")
             continue
         try:
             loop.run(text)
@@ -399,8 +300,11 @@ def main() -> None:
                 if latest and latest["id"] != app.session_id:
                     _do_resume(app, latest["id"])
             prompt = " ".join(args.prompt)
-            app.loop.run(prompt)
-            _after_turn(app, prompt)
+            if prompt.strip().startswith("/"):
+                _dispatch_command(app, prompt)
+            else:
+                app.loop.run(prompt)
+                _after_turn(app, prompt)
         except Exception as e:
             app.ui.warn(f"error: {e}")
         finally:

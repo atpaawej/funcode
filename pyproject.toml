@@ -5,6 +5,7 @@ description = "funcode - personal extensible agent (v0 raw loop)"
 requires-python = ">=3.10"
 dependencies = [
   "openai>=1.0.0",
+  "prompt-toolkit>=3.0.53",
   "rich>=13.0.0",
 ]
 

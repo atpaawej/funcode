@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.text import Text
 
+from .complete import match_commands
 from .summaries import format_call, format_result
 
 console = Console()
@@ -66,11 +67,54 @@ def _preview_md(buf: str) -> str:
     return buf + "▍" if buf and not buf.endswith("\n") else buf
 
 
+def build_menu_completer(items: list[tuple[str, str]],
+                         meta: dict[str, tuple[str, str]],
+                         files: list[str]):
+    """Slash-menu + @file completer. Module-level (not a closure) so tests
+    can drive it with fake Documents. Returns None if prompt_toolkit
+    is unavailable."""
+    try:
+        from prompt_toolkit.completion import Completer, Completion
+    except ImportError:
+        return None
+
+    class _FuncodeCompleter(Completer):
+        def get_completions(self, document, _ev):
+            import re as _re
+            text = document.text_before_cursor
+            m = _re.match(r"^/([^\s]*)$", text)
+            if m:
+                frag = m.group(1)
+                for n in match_commands(items, frag):
+                    desc, src = meta[n]
+                    tag = f" · {src}" if src else ""
+                    yield Completion(
+                        "/" + n, start_position=-(len(frag) + 1),
+                        display=f"/{n}",
+                        display_meta=f"{desc}{tag}"[:80])
+                return
+            m2 = _re.search(r"@([\w.\-]*(?:/[\w.\-]*)*)$", text)
+            if m2:
+                frag = m2.group(1).lower()
+                n = 0
+                for f in files:
+                    if frag in f.lower():
+                        yield Completion(f, start_position=-len(m2.group(1)),
+                                         display=f)
+                        n += 1
+                        if n >= 30:
+                            break
+
+    return _FuncodeCompleter()
+
+
 class RichRenderer:
     def __init__(self, verbose: bool = False, show_thinking: bool = True):
         # verbose = expanded reasoning (full stream); show_thinking = collapsed line.
         self.verbose = verbose
         self.show_thinking = show_thinking
+        # Persistent prompt_toolkit session (input history + slash menu).
+        self._pt_session = None
         # --- streaming state ---
         self._live: Live | None = None
         self._content = ""
@@ -107,7 +151,8 @@ class RichRenderer:
         )
 
     def startup_block(self, *, model: str, cwd: str, tools: list[str], auto: bool,
-                      used: int, window: int, live: bool) -> None:
+                      used: int, window: int, live: bool,
+                      custom_commands: list[str] | None = None) -> None:
         """Organized REPL header: aligned status rows + grouped commands.
 
         live=False (no API call yet, like Claude Code's null current_usage):
@@ -125,8 +170,12 @@ class RichRenderer:
             console.print(f"[dim]context  [/dim]{format_k(window)} window")
         console.print()
         console.print("[dim]session   [/dim][dim]/new /resume /sessions /history /rename[/dim]")
-        console.print("[dim]agent     [/dim][dim]/compact /context /tools /thinking /verbose[/dim]")
-        console.print("[dim]general   [/dim][dim]/clear /exit[/dim]")
+        console.print("[dim]agent     [/dim][dim]/compact /context /tools /thinking /verbose /providers[/dim]")
+        if custom_commands:
+            shown = " ".join(f"/{c}" for c in custom_commands[:12])
+            more = f" (+{len(custom_commands) - 12} more)" if len(custom_commands) > 12 else ""
+            console.print(f"[dim]custom    [/dim][dim]{shown}{more}[/dim]")
+        console.print("[dim]general   [/dim][dim]/help /clear /exit[/dim]")
 
     def context_detail(self, usage: dict) -> None:
         """Claude-style breakdown: where the tokens actually go, plus the
@@ -372,5 +421,101 @@ class RichRenderer:
         except (KeyboardInterrupt, EOFError):
             return False
 
-    def prompt(self) -> str:
-        return console.input("[bold cyan]› [/]")
+    def prompt(self, commands: dict[str, str | tuple[str, str]] | None = None,
+               cwd=None) -> str:
+        """REPL input with a Claude-style slash menu (prompt_toolkit).
+
+        `/` at position 0 opens the menu: live fuzzy filter, arrows move,
+        Enter runs (exact typed match beats highlight), Tab completes the
+        name, Esc dismisses. `@` opens the file menu. Falls back to plain
+        console.input when prompt_toolkit is unavailable or fails.
+
+        `commands` maps name -> description or (description, source).
+        """
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.history import FileHistory
+            from prompt_toolkit.key_binding import KeyBindings
+            from prompt_toolkit.patch_stdout import patch_stdout
+            from prompt_toolkit.shortcuts import CompleteStyle
+        except ImportError:
+            return console.input("[bold cyan]› [/]")
+        from .complete import exact_command
+
+        meta: dict[str, tuple[str, str]] = {}
+        for name, v in (commands or {}).items():
+            if isinstance(v, tuple):
+                meta[name.lower()] = (v[0], v[1] if len(v) > 1 else "")
+            else:
+                meta[name.lower()] = (v, "")
+        items = [(n, src) for n, (_d, src) in meta.items()]
+        names = set(meta)
+        files = self._file_index(cwd) if cwd is not None else []
+        completer = build_menu_completer(items, meta, files)
+
+        # Exact typed `/command` must beat the menu highlight on Enter
+        # (the long-open Claude #19107 bug class). Only when the user has
+        # NOT navigated: cancel_completion() restores the original text,
+        # so it must never run after arrow-key navigation (that would wipe
+        # the selection). A navigated selection always wins.
+        kb = KeyBindings()
+
+        @kb.add("enter")
+        def _(event):
+            buf = event.app.current_buffer
+            cs = buf.complete_state
+            if cs is not None and cs.complete_index is None and \
+                    exact_command(buf.text, names) is not None:
+                buf.cancel_completion()
+            buf.validate_and_handle()
+
+        if self._pt_session is None:
+            history = None
+            try:
+                from ..core.session import config_root
+                hist = config_root() / "history"
+                hist.parent.mkdir(parents=True, exist_ok=True)
+                history = FileHistory(str(hist))
+            except Exception:
+                history = None
+            try:
+                self._pt_session = PromptSession(history=history)
+            except Exception:
+                return console.input("[bold cyan]› [/]")
+        try:
+            with patch_stdout():
+                return self._pt_session.prompt(
+                    "› ", completer=completer,
+                    complete_while_typing=True,
+                    complete_style=CompleteStyle.COLUMN,
+                    key_bindings=kb)
+        except (KeyboardInterrupt, EOFError):
+            raise
+        except Exception:
+            return console.input("[bold cyan]› [/]")
+
+    @staticmethod
+    def _file_index(cwd) -> list[str]:
+        """Pruned relative file list for @ completion (cap 1000)."""
+        from pathlib import Path as _Path
+        root = _Path(cwd)
+        skip = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache",
+                ".pytest_cache", "dist", "build"}
+        out: list[str] = []
+        try:
+            for p in root.rglob("*"):
+                if len(out) >= 1000:
+                    break
+                try:
+                    rel = p.relative_to(root)
+                except ValueError:
+                    continue
+                if any(part in skip or part.startswith(".") for part in rel.parts[:-1]):
+                    continue
+                if rel.parts[-1].startswith(".") and len(rel.parts) == 1:
+                    continue
+                if p.is_file() and not p.is_symlink():
+                    out.append(str(rel))
+        except OSError:
+            pass
+        return sorted(out)

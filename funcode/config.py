@@ -47,3 +47,43 @@ def load_settings(explicit: str | None = None) -> dict:
         "No settings.json found. Copy settings.example.json to settings.json "
         "or ~/.config/funcode/settings.json and set base_url/api_key/model."
     )
+
+
+def project_settings_path(cwd: Path | None = None) -> Path:
+    base = Path(cwd) if cwd is not None else Path.cwd()
+    return base / "settings.json"
+
+
+def global_settings_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    return Path(xdg) / "funcode" / "settings.json"
+
+
+def save_settings(path: Path, patch: dict) -> Path:
+    """Merge `patch` into the JSON file at `path` (created if missing).
+
+    Preserves all other keys. `_source` is never written. When the merged
+    settings contain a literal (non-${ENV}) provider.api_key, the file is
+    chmodded 600. Returns the path written.
+    """
+    data: dict = {}
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(data.get(k), dict):
+            data[k] = {**data[k], **v}
+        else:
+            data[k] = v
+    data.pop("_source", None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    try:
+        key = (data.get("provider") or {}).get("api_key", "")
+        if key and not (isinstance(key, str) and key.startswith("$")):
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path

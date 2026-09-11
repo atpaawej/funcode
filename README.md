@@ -25,6 +25,36 @@ https://agent.tinyfish.ai/api-keys. `web_fetch` needs no key.
 
 `read, write, edit, bash, glob, grep, web_fetch, web_search`
 
+## Commands
+
+Slash commands + skills are one unified registry (`funcode/commands/` —
+`Command` / `CommandProvider` / `CommandRegistry`, mirroring `core/tools.py`).
+Plugins register with one `add_provider` call; loop unchanged.
+
+- Project: `.funcode/commands/*.md`, `.funcode/skills/*/SKILL.md`
+- Generic: `.agents/commands/*.md`, `.agents/skills/*/SKILL.md` (shared across agents)
+- Compat: `.claude/...`, `.opencode/commands/...` (read-only interop)
+- Global: `~/.config/funcode/commands/*.md`, `~/.config/funcode/skills/*/SKILL.md`
+- File wins over builtin; project wins over global. `/help` lists all with source.
+
+```md
+---
+description: Review code for correctness bugs
+---
+Review $ARGUMENTS. Recent commits: !`git log --oneline -10`. See @src/main.py.
+```
+
+Placeholders: `$ARGUMENTS`, `$1/$2/...`, `` !`shell` `` (output injected,
+read-only git-style cmds allowed freely), `@path` (file injected, cwd-confined).
+Type `/` for command completion, `@` for file search (needs `prompt_toolkit`,
+else plain input). `/providers` adds a provider + saves the key
+(project vs global `settings.json`, `chmod 600`, never echoed).
+
+REPL input is a Claude-style menu: `/` opens the command list with live
+fuzzy filtering (`↑↓` navigate, `Enter` runs, `Tab` completes the name,
+`Esc` dismisses). An exactly-typed `/command` always beats the highlight
+on Enter. Input history persists to `~/.config/funcode/history`.
+
 ## UI
 
 Token-by-token SSE streaming with live Markdown preview. Assistant text renders
@@ -73,4 +103,4 @@ New providers (MCP, plugins): implement `ToolProvider` / `LLMProvider` — loop 
 
 ## Roadmap
 
-sessions + resume → slash commands → MCP client → plugins → TUI.
+sessions + resume → slash commands + skills ✅ → MCP client → plugins → TUI.
